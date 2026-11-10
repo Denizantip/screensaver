@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""Rotating globe in the terminal, drawn with Braille characters.
+
+Usage:  python globe_day_night_numpy.py [--fps 30] [--speed 40] [--tilt 20] [--color N]
+                [--aspect 2.2] [--sun-azimuth 55] [--sun-elevation 10] [--no-night] [--real]
+Quit with Ctrl+C.  Needs a terminal/font that supports Braille (U+2800..U+28FF).
+
+Colors: by default each Braille cell is colored by the most important thing it
+shows (land, outline, sunlit ocean or grid) and by how sunlit it is (night,
+twilight or day) -- see REGION_COLORS. --color N paints everything with one
+ANSI 256-color code instead; --color -1 turns color off.
+
+This is the NumPy version (pip install numpy): the per-dot work and the frame
+assembly are vectorized, so large terminals and high frame rates stay cheap.
+
+The land map is a 0.5-degree bitmap (rasterized from Natural Earth, public
+domain), embedded at the bottom of the settings as zlib-compressed, base64 text.
+
+All tunable numbers live in the SETTINGS section right below. Nothing in the
+code after that section contains hard-coded values.
+"""
+import argparse
+import base64
+import math
+from datetime import datetime, timezone
+import shutil
+import sys
+import time
+import zlib
+from typing import NamedTuple
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("This version needs NumPy:  pip install numpy")
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+# --- Command-line defaults (can be overridden with --fps, --speed, ...) ------
+DEFAULT_FPS = 30            # target frames per second
+DEFAULT_SPEED = 40          # rotation speed, degrees per second
+DEFAULT_TILT = 20           # visual axial tilt: how far the north pole leans toward you
+DEFAULT_COLOR = None        # None = per-region colors (REGION_COLORS below);
+                            #   an ANSI 256-color code = one color for everything;
+                            #   -1 = no color
+DEFAULT_ASPECT = 2.2        # fallback terminal cell height / width
+REAL_SUN_UPDATE_SECONDS = 60  # refresh the real solar direction this often
+
+# --- Globe appearance --------------------------------------------------------
+GLOBE_MARGIN_DOTS = 0.5     # empty space between globe edge and screen edge
+EDGE_THICKNESS = 0.8        # outline thickness (in terminal-cell widths)
+
+# Grid (latitude / longitude lines)
+GRID_SPACING = 30           # degrees between grid lines
+GRID_LINE_HALF_WIDTH = 0.5  # line half-width in degrees (smaller = thinner)
+GRID_DENSITY = 0.75         # 0..1, share of dots drawn on a grid line
+                            #   (lower = fainter / sparser grid)
+GRID_MIN_Z = 0.2            # hide grid near the globe's edge (0 = show all)
+GRID_MIN_COS_LAT = 0.25     # limits how wide lon-lines get near the poles
+
+# Shading (3D look: surface is denser in the center, thinner at the edge)
+SHADE_MIN = 0.15            # brightness at the very edge of the globe
+SHADE_GAMMA = 0.7           # <1 keeps the center brighter for longer
+LAND_DENSITY = 0.55         # lower = land more solid, higher = more dithered
+
+# Day / night lighting. The sun is fixed relative to your screen, so as the
+# globe spins, land moves from the dark side into the light and back again.
+DAY_NIGHT = True            # False = no lighting (uniform globe)
+SUN_AZIMUTH = 55            # sun direction, degrees left/right of the viewer
+                            #   (+ = sun on the right, - = left, 0 = behind you)
+SUN_ELEVATION = 10          # sun direction, degrees above (+) / below (-) equator
+TERMINATOR_SOFTNESS = 0.15  # width of the dawn/dusk blend (0 = razor-sharp line)
+NIGHT_LEVEL = 0.12          # how bright the night side is (0 = black, 1 = same as day)
+DAY_AMBIENT = 0.6           # day-side brightness where the sun is at a low angle
+                            #   (1 = flat daylight, lower = stronger noon highlight)
+OCEAN_DAY_DENSITY = 0.15    # share of dots lighting up the sunlit ocean (0 = none)
+
+# --- Region colors (ANSI 256-color codes) ------------------------------------
+# A Braille cell can only have one color, so a cell takes the color of the most
+# important thing drawn in it: land > outline > sunlit ocean > grid.
+# Each entry is (night, twilight, day), chosen by how sunlit the dot is.
+# Only used when --color / DEFAULT_COLOR is not set. Without day/night
+# lighting everything uses the "day" color.
+# REGION_COLORS = {
+#     "land":  (24, 173, 78),     # dark blue silhouette -> orange dusk -> green
+#     "edge":  (60, 103, 153),    # globe outline: dim violet -> pale blue
+#     "ocean": (17, 33, 39),      # sparkle on the sunlit sea: navy -> bright blue
+#     "grid":  (236, 240, 67),    # latitude / longitude lines: dark gray -> steel blue
+# }
+
+REGION_COLORS = {
+    "land": (
+        (18, 32, 55),
+        (190, 105, 55),
+        (65, 180, 95),
+    ),
+    "edge": (
+        (45, 55, 85),
+        (105, 140, 190),
+        (170, 205, 230),
+    ),
+    "ocean": (
+        (5, 18, 35),
+        (20, 75, 115),
+        (35, 125, 190),
+    ),
+    "grid": (
+        (55, 60, 75),
+        (125, 135, 145),
+        (195, 205, 215),
+    ),
+}
+
+TWILIGHT_RANGE = (0.2, 0.8)  # dawn/dusk band, as share of daylight (0 = night, 1 = day)
+                             #   (widen it by raising TERMINATOR_SOFTNESS too)
+
+# --- Terminal / rendering geometry -------------------------------------------
+RESERVED_ROWS = 1           # terminal lines left unused (prevents scrolling)
+FALLBACK_TERMINAL_SIZE = (80, 24)   # used if terminal size can't be detected
+
+BRAILLE_BASE = 0x2800       # Unicode code point of the empty Braille cell
+DOTS_X = 2                  # Braille dots per cell, horizontally
+DOTS_Y = 4                  # Braille dots per cell, vertically
+# Bit value of each dot, indexed [dot_x][dot_y]
+BRAILLE_BITS = ((0x01, 0x02, 0x04, 0x40),
+                (0x08, 0x10, 0x20, 0x80))
+
+# Ordered-dithering matrix (any square matrix of unique values 0..N*N-1)
+BAYER = (
+    (0, 8, 2, 10),
+    (12, 4, 14, 6),
+    (3, 11, 1, 9),
+    (15, 7, 13, 5),
+)
+
+# --- World map data ----------------------------------------------------------
+MAP_W, MAP_H = 720, 360     # bitmap size (equirectangular projection)
+LON_MIN = -180              # longitude of the left edge of the map
+LAT_MAX = 90                # latitude of the top edge of the map
+MAP_PX_PER_DEG = 2          # map pixels per degree (720 / 360)
+HALF_TURN = 180             # degrees
+FULL_TURN = 360             # degrees
+
+# --- ANSI escape sequences ---------------------------------------------------
+ANSI_ENTER_SCREEN = "\x1b[?1049h\x1b[?25l\x1b[2J"  # alt screen, hide cursor, clear
+ANSI_LEAVE_SCREEN = "\x1b[0m\x1b[?25h\x1b[?1049l"  # reset color, show cursor, back
+ANSI_CLEAR = "\x1b[2J"
+ANSI_HOME = "\x1b[H"
+ANSI_COLOR = "\x1b[38;5;{}m"
+ANSI_RGB_COLOR = "\x1b[38;2;{};{};{}m"  # 24-bit truecolor
+
+# --- Embedded land bitmap (zlib + base64, 1 bit per pixel, row 0 = north) ----
+LAND_B64 = (
+    "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"
+)
+
+# =============================================================================
+# CODE
+# =============================================================================
+
+BAYER_SIZE = len(BAYER)
+BAYER_LEVELS = BAYER_SIZE * BAYER_SIZE
+DOT_WIDTH = 1 / DOTS_X      # width of one dot, in terminal-cell widths
+
+# What a dot can show, in ascending priority (index = priority; 0 = nothing)
+KIND_NAMES = ("none", "grid", "ocean", "edge", "land")
+KIND_GRID, KIND_OCEAN, KIND_EDGE, KIND_LAND = 1, 2, 3, 4
+BAND_NIGHT, BAND_TWILIGHT, BAND_DAY = 0, 1, 2
+BANDS = 3
+EMPTY_CELL = " "            # a plain space: stays blank in every font
+BRAILLE_BIT_TABLE = np.array(BRAILLE_BITS, dtype=np.uint8)  # [dot_x, dot_y] -> bit
+BAYER_ARRAY = np.array(BAYER)
+# Output character for every possible cell value (0 = empty -> EMPTY_CELL)
+CELL_CODEPOINTS = np.array([ord(EMPTY_CELL)] + [BRAILLE_BASE + b for b in range(1, 256)],
+                           dtype="<u4")
+NEWLINE_CODEPOINT = ord("\n")
+
+
+def load_land():
+    """Return a flat boolean array of MAP_W*MAP_H, True = land. Row 0 is the north edge."""
+    packed = np.frombuffer(zlib.decompress(base64.b64decode(LAND_B64)), dtype=np.uint8)
+    if packed.size * 8 != MAP_W * MAP_H:
+        sys.exit(f"land bitmap has {packed.size * 8} bits, expected {MAP_W * MAP_H}")
+    return np.unpackbits(packed).astype(bool)  # most significant bit first
+
+
+def detect_aspect(default=DEFAULT_ASPECT):
+    """Cell height / cell width, from the terminal's pixel size if it reports it."""
+    try:
+        import fcntl
+        import struct
+        import termios
+        rows, cols, xpix, ypix = struct.unpack(
+            "HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+        if rows and cols and xpix and ypix:
+            return (ypix / rows) / (xpix / cols)
+    except Exception:
+        pass
+    return default
+
+
+def sun_vector(azimuth_deg, elevation_deg):
+    """Unit vector pointing to the sun, in screen space (x right, y up, z toward you)."""
+    az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+    return (math.sin(az) * math.cos(el), math.sin(el), math.cos(az) * math.cos(el))
+
+
+def solar_position_utc(utc):
+    """Return (GMST, solar right ascension, solar declination), in degrees.
+
+    The solar coordinates use the apparent ecliptic longitude and corrected
+    obliquity. This compact approximation is accurate enough for a terminal
+    globe while accounting for the equation of time and Earth's orbital tilt.
+    """
+    jd = 2440587.5 + utc.timestamp() / 86400.0
+    t = (jd - 2451545.0) / 36525.0
+
+    mean_longitude = (280.46646 + t * (36000.76983 + 0.0003032 * t)) % 360.0
+    mean_anomaly = math.radians(
+        (357.52911 + t * (35999.05029 - 0.0001537 * t)) % 360.0)
+    eccentricity = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
+    equation_center = (
+        math.sin(mean_anomaly) * (1.914602 - t * (0.004817 + 0.000014 * t))
+        + math.sin(2 * mean_anomaly) * (0.019993 - 0.000101 * t)
+        + math.sin(3 * mean_anomaly) * 0.000289
+    )
+    true_longitude = mean_longitude + equation_center
+    omega = math.radians(125.04 - 1934.136 * t)
+    apparent_longitude = math.radians(
+        true_longitude - 0.00569 - 0.00478 * math.sin(omega))
+
+    mean_obliquity = 23.0 + (
+        26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0
+    ) / 60.0
+    obliquity = math.radians(mean_obliquity + 0.00256 * math.cos(omega))
+
+    right_ascension = math.degrees(math.atan2(
+        math.cos(obliquity) * math.sin(apparent_longitude),
+        math.cos(apparent_longitude))) % 360.0
+    declination = math.degrees(math.asin(
+        math.sin(obliquity) * math.sin(apparent_longitude)))
+
+    gmst = (
+        280.46061837
+        + 360.98564736629 * (jd - 2451545.0)
+        + 0.000387933 * t * t
+        - t * t * t / 38710000.0
+    ) % 360.0
+    return gmst, right_ascension, declination
+
+
+def real_sun_angles(right_ascension_deg, declination_deg, tilt_deg):
+    """Convert the Sun's celestial coordinates to the globe's screen angles.
+
+    The screen's forward direction is anchored to RA=0 (the vernal equinox).
+    The inverse globe tilt then converts the celestial direction to the
+    un-tilted screen coordinates expected by precompute().
+    """
+    ra = math.radians(right_ascension_deg)
+    dec = math.radians(declination_deg)
+    tilt = math.radians(tilt_deg)
+    sx = math.cos(dec) * math.sin(ra)
+    sy_world = math.sin(dec)
+    sz_world = math.cos(dec) * math.cos(ra)
+    sy = sy_world * math.cos(tilt) - sz_world * math.sin(tilt)
+    sz = sy_world * math.sin(tilt) + sz_world * math.cos(tilt)
+    azimuth = math.degrees(math.atan2(sx, sz))
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, sy))))
+    return azimuth, elevation
+
+
+def smoothstep(edge0, edge1, x):
+    """0 below edge0, 1 above edge1, smooth S-curve in between (x is an array)."""
+    if edge1 <= edge0:
+        return np.where(x >= edge0, 1.0, 0.0)
+    u = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return u * u * (3 - 2 * u)
+
+
+def build_color_table(region_colors):
+    """Escape string for every (kind, band) pair, indexed by kind * BANDS + band."""
+    table = [""] * (len(KIND_NAMES) * BANDS)
+    for kind, name in enumerate(KIND_NAMES):
+        if kind == 0:
+            continue
+        for band in range(BANDS):
+            # table[kind * BANDS + band] = ANSI_COLOR.format(region_colors[name][band])
+            table[kind * BANDS + band] = ANSI_RGB_COLOR.format(
+                *region_colors[name][band]
+            )
+    return table
+
+
+class Scene(NamedTuple):
+    """Everything about the dots that stays the same from frame to frame.
+
+    All arrays have one entry per dot inside the globe, sorted by terminal cell
+    so each cell's dots are contiguous (that is what makes reduceat possible).
+    """
+    starts: np.ndarray      # index of the first dot of every non-empty cell
+    cells: np.ndarray       # flat cell index (row * cols + col) for each of those
+    base_lon: np.ndarray    # longitude of each dot before the globe rotates
+    row_off: np.ndarray     # map row * MAP_W
+    mask: np.ndarray        # Braille bit of the dot inside its cell
+    band: np.ndarray        # night / twilight / day
+    land_kind: np.ndarray   # what to draw here if the dot is over land (0 = nothing)
+    water_kind: np.ndarray  # ... and if it is over water (lat lines already in)
+    lon_idx: np.ndarray     # dots that need a per-frame longitude-line test
+    lon_tol: np.ndarray     # their longitude-line tolerance
+
+
+def precompute(cols, rows, tilt_deg, aspect, sun_az, sun_el, day_night):
+    """Per-dot data that doesn't change from frame to frame (None = nothing to draw).
+
+    Units: one terminal cell is 1 wide and `aspect` tall, so a Braille dot is
+    DOT_WIDTH wide and aspect/DOTS_Y tall -- the globe stays round on screen.
+    """
+    W, H = cols * DOTS_X, rows * DOTS_Y
+    dot_w, dot_h = DOT_WIDTH, aspect / DOTS_Y
+    R = min(W * dot_w, H * dot_h) / 2 - GLOBE_MARGIN_DOTS
+    if R <= 0:  # terminal too small for a globe
+        return None
+    cx, cy = W / 2, H / 2
+    t = math.radians(tilt_deg)
+    ct, st = math.cos(t), math.sin(t)
+    edge_r2 = (1 - EDGE_THICKNESS / R) ** 2
+    half_spacing = GRID_SPACING / 2
+    sx, sy, sz = sun_vector(sun_az, sun_el)
+    ocean_density = OCEAN_DAY_DENSITY if day_night else 0.0
+
+    py, px = np.mgrid[0:H, 0:W]  # every dot, row by row
+    y = (cy - py - 0.5) * dot_h / R
+    x = (px + 0.5 - cx) * dot_w / R
+    r2 = x * x + y * y
+    inside = r2 <= 1
+    if not inside.any():
+        return None
+    px, py, x, y, r2 = px[inside], py[inside], x[inside], y[inside], r2[inside]
+
+    z = np.sqrt(1 - r2)
+    # tilt the globe's axis toward the viewer
+    y2 = y * ct + z * st
+    z2 = -y * st + z * ct
+    lat = np.degrees(np.arcsin(np.clip(y2, -1.0, 1.0)))
+    base_lon = np.degrees(np.arctan2(x, z2))
+    row = np.clip(((LAT_MAX - lat) * MAP_PX_PER_DEG).astype(np.intp), 0, MAP_H - 1)
+    lat_line = np.abs(((lat + half_spacing) % GRID_SPACING) - half_spacing) \
+        < GRID_LINE_HALF_WIDTH
+    lon_tol = GRID_LINE_HALF_WIDTH / np.maximum(
+        np.cos(np.radians(lat)), GRID_MIN_COS_LAT)
+    thr = (BAYER_ARRAY[py % BAYER_SIZE, px % BAYER_SIZE] + 0.5) / BAYER_LEVELS
+    shade = SHADE_MIN + (1 - SHADE_MIN) * z ** SHADE_GAMMA
+    band = np.full(x.shape, BAND_DAY, dtype=np.uint8)
+    if day_night:
+        # (x, y, z) is also the surface normal; dot with sun = sunlight
+        light = x * sx + y * sy + z * sz
+        day = smoothstep(-TERMINATOR_SOFTNESS, TERMINATOR_SOFTNESS, light)
+        diffuse = DAY_AMBIENT + (1 - DAY_AMBIENT) * np.maximum(light, 0.0)
+        shade = shade * (NIGHT_LEVEL + (1 - NIGHT_LEVEL) * day * diffuse)
+        band = np.where(day < TWILIGHT_RANGE[0], BAND_NIGHT,
+                        np.where(day < TWILIGHT_RANGE[1], BAND_TWILIGHT, BAND_DAY)
+                        ).astype(np.uint8)
+
+    # Decide as much as possible now. Per dot, the first rule that applies wins:
+    # outline > land > sunlit ocean > grid line.
+    edge = r2 > edge_r2
+    land_ok = shade > thr * LAND_DENSITY      # land thins out toward the edge
+    ocean_hit = thr < shade * ocean_density
+    grid_ok = (z > GRID_MIN_Z) & (thr < GRID_DENSITY) & ~ocean_hit
+    land_kind = np.where(edge, KIND_EDGE, np.where(land_ok, KIND_LAND, 0))
+    water_kind = np.where(edge, KIND_EDGE, np.where(
+        ocean_hit, KIND_OCEAN, np.where(grid_ok & lat_line, KIND_GRID, 0)))
+    needs_lon_test = grid_ok & ~lat_line & ~edge  # longitude lines move with rot
+
+    cell = (py // DOTS_Y) * cols + px // DOTS_X
+    order = np.argsort(cell, kind="stable")
+    cell = cell[order]
+    starts = np.flatnonzero(np.concatenate(([True], cell[1:] != cell[:-1])))
+    lon_idx = np.flatnonzero(needs_lon_test[order])
+    return Scene(
+        starts=starts, cells=cell[starts],
+        base_lon=base_lon[order], row_off=(row * MAP_W)[order],
+        mask=BRAILLE_BIT_TABLE[px % DOTS_X, py % DOTS_Y][order],
+        band=band[order],
+        land_kind=land_kind.astype(np.uint8)[order],
+        water_kind=water_kind.astype(np.uint8)[order],
+        lon_idx=lon_idx, lon_tol=lon_tol[order][lon_idx])
+
+
+def cells_to_text(bits, codes, cols, rows, color_table):
+    """Turn per-cell Braille bits (and color codes) into the frame's text."""
+    grid = np.empty((rows, cols + 1), dtype="<u4")
+    grid[:, :cols] = CELL_CODEPOINTS[bits].reshape(rows, cols)
+    grid[:, cols] = NEWLINE_CODEPOINT
+    text = grid.tobytes().decode("utf-32-le")[:-1]  # drop the last newline
+    if color_table is None:
+        return text
+    filled = np.flatnonzero(bits)
+    if filled.size == 0:
+        return text
+    c = codes[filled]
+    change = np.concatenate(([True], c[1:] != c[:-1]))  # color differs from previous
+    at = filled[change]
+    positions = (at + at // cols).tolist()  # cell index -> text index (newlines)
+    parts, prev = [], 0
+    for pos, code in zip(positions, c[change].tolist()):  # only a few hundred
+        parts.append(text[prev:pos])
+        parts.append(color_table[code])
+        prev = pos
+    parts.append(text[prev:])
+    return "".join(parts)
+
+
+def render(scene, land, cols, rows, rot, color_table=None):
+    """Draw one frame and return it as text.
+
+    color_table: None = plain Braille (the caller sets one global color), or the
+    list from build_color_table() to color every cell individually.
+    """
+    if scene is None:
+        return "\n".join([EMPTY_CELL * cols] * rows)
+    half_spacing = GRID_SPACING / 2
+    lon = scene.base_lon - rot
+    column = np.floor((lon - LON_MIN) * MAP_PX_PER_DEG).astype(np.intp) % MAP_W
+    over_land = land[scene.row_off + column]
+
+    water = scene.water_kind.copy()
+    idx = scene.lon_idx
+    if idx.size:  # longitude lines
+        hit = np.abs(((lon[idx] + half_spacing) % GRID_SPACING) - half_spacing) \
+            < scene.lon_tol
+        water[idx[hit]] = KIND_GRID
+    kind = np.where(over_land, scene.land_kind, water)
+
+    # Per cell: OR of the drawn dots' bits, and the highest-priority color code.
+    # (A drawn dot's code is >= BANDS, an undrawn dot's is < BANDS, so drawn wins.)
+    code = kind * BANDS + scene.band
+    bits = np.zeros(rows * cols, dtype=np.uint8)
+    codes = np.zeros(rows * cols, dtype=np.uint8)
+    bits[scene.cells] = np.bitwise_or.reduceat(scene.mask * (kind > 0), scene.starts)
+    codes[scene.cells] = np.maximum.reduceat(code, scene.starts)
+    return cells_to_text(bits, codes, cols, rows, color_table)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Rotating Braille globe")
+    ap.add_argument("--fps", type=float, default=DEFAULT_FPS,
+                    help="frames per second")
+    ap.add_argument("--speed", type=float, default=DEFAULT_SPEED,
+                    help="rotation speed in degrees per second (ignored with --real)")
+    ap.add_argument("--tilt", type=float, default=DEFAULT_TILT,
+                    help="visual axial tilt, degrees")
+    ap.add_argument("--color", type=int, default=DEFAULT_COLOR,
+                    help="one ANSI 256 color for everything (-1 = no color); "
+                         "default: per-region colors")
+    ap.add_argument("--aspect", type=float, default=None,
+                    help=f"cell height/width (default: auto-detect, fallback "
+                         f"{DEFAULT_ASPECT}). Increase if the globe looks too "
+                         f"narrow, decrease if too wide.")
+    ap.add_argument("--sun-azimuth", type=float, default=SUN_AZIMUTH,
+                    help="sun direction: degrees to the right (+) or left (-; ignored with --real)")
+    ap.add_argument("--sun-elevation", type=float, default=SUN_ELEVATION,
+                    help="sun direction: degrees above (+) or below (-) the equator (ignored with --real)")
+    ap.add_argument("--no-night", action="store_true",
+                    help="turn off day/night lighting")
+    ap.add_argument("--real", action="store_true",
+                    help="use UTC for sidereal Earth rotation and astronomical sunlight")
+    args = ap.parse_args()
+    day_night = DAY_NIGHT and not args.no_night
+    color_table = build_color_table(REGION_COLORS) if args.color is None else None
+
+    land = load_land()
+    aspect = args.aspect if args.aspect else detect_aspect()
+    size = None
+    scene = None
+    cols = rows = 0
+
+    sys.stdout.write(ANSI_ENTER_SCREEN)
+    if args.color is not None and args.color >= 0:
+        sys.stdout.write(ANSI_COLOR.format(args.color))
+    rot = 0.0
+    sun_azimuth, sun_elevation = args.sun_azimuth, args.sun_elevation
+    next_sun_update = 0.0
+    last = time.perf_counter()
+    try:
+        while True:
+            now = time.perf_counter()
+            dt, last = now - last, now
+            refresh_sun = False
+            if args.real:
+                utc_now = datetime.now(timezone.utc)
+                rot, sun_ra, sun_dec = solar_position_utc(utc_now)
+                if day_night and now >= next_sun_update:
+                    sun_azimuth, sun_elevation = real_sun_angles(
+                        sun_ra, sun_dec, args.tilt)
+                    next_sun_update = now + REAL_SUN_UPDATE_SECONDS
+                    refresh_sun = True
+            else:
+                rot = (rot + args.speed * dt) % FULL_TURN
+
+            new_size = shutil.get_terminal_size(FALLBACK_TERMINAL_SIZE)
+            resized = new_size != size
+            if resized or refresh_sun:  # (re)build on resize / solar update
+                size = new_size
+                cols, rows = size.columns, max(1, size.lines - RESERVED_ROWS)
+                if resized and not args.aspect:
+                    aspect = detect_aspect()
+                scene = precompute(cols, rows, args.tilt, aspect,
+                                   sun_azimuth, sun_elevation, day_night)
+                if resized:
+                    sys.stdout.write(ANSI_CLEAR)
+
+            frame = render(scene, land, cols, rows, rot, color_table)
+            sys.stdout.write(ANSI_HOME + frame)
+            sys.stdout.flush()
+
+            sleep = 1.0 / args.fps - (time.perf_counter() - now)
+            if sleep > 0:
+                time.sleep(sleep)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(ANSI_LEAVE_SCREEN)
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
