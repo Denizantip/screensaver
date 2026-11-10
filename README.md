@@ -8,8 +8,8 @@ The Linux TTY may not display Unicode Braille characters correctly with its defa
 
 The setup uses two font files:
 
-- `Lat15-Fixed16.psf.gz` — regular Latin characters.
-- `brl-16x8.psf` — Braille characters.
+- `Lat15-Fixed16.psf.gz` - regular Latin characters.
+- `brl-16x8.psf` - Braille characters.
 
 ## Requirements
 
